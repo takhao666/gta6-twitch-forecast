@@ -27,6 +27,21 @@ hour-1 print.
     pool's empirical quantiles at the five levels -- the smooth curve
     steadies the tails, the empirical quantiles keep them honest.
     Multiply by the hour-1 print and round half-up to 2 decimals.
+  * One refinement, fitted from the pool alone: a launch's shape depends
+    on its hour-1 magnitude. Across the pool, log(peak/hour-1) correlates
+    -0.74 with log(hour-1), and the per-hour regression slope of the
+    log-ratio on log(hour-1) grows from ~0 in the early hours to about
+    -0.45 at the evening peak -- launches whose hour 1 is small (a small
+    New Zealand footprint next to a big global audience) rise much
+    further by the evening. So before pooling, each member's ratios are
+    aligned to the target's hour-1 level: ratio - b_h * (log hour-1 -
+    log target hour-1), where b_h is that hour's OLS slope shrunk 50%
+    toward the pooled slope over all hours. The target's log hour-1 is
+    clamped to the pool's observed range, so a GTA-VI-sized hour 1 does
+    not extrapolate the slope. The spread is the aligned ratios' IQR /
+    1.349, widened 1.5x: conditioning removes systematic variation, so
+    the raw IQR would understate the remaining spread, and the extra
+    width is cheap insurance if the target is an outlier launch.
 
 Grounding (web research, 2026-11-17): the biggest single-player Twitch
 peaks on record are Hogwarts Legacy ~1.28M, Cyberpunk 2077 ~1.14M and
@@ -40,7 +55,7 @@ Validation (leave-one-out over the 15 pool launches in the kit's
 practice data, mean pinball loss on the log scale, lower is better;
 re-run against the shipped code, not the analysis draft):
   house persistence baseline   mean 0.447, median 0.309
-  this forecaster (blend)      mean 0.305, median 0.178
+  this forecaster (blend)      mean 0.284, median 0.177
 The house baseline scores ~0.387 on the four practice launches; this
 forecaster beats it on the same kind of launch (rolling midnight,
 console-led). No network, no clock, no randomness: two runs on the same
@@ -149,20 +164,66 @@ def round2(x):
     return int(value) if value == int(value) else value
 
 
-def hour_quantiles(pool_days, hour1_print, hour):
-    """The five quantiles of one hour, as viewer counts."""
-    ratios = []
+def hour_ratio_pairs(pool_days, hour):
+    """(log hour-1 print, log ratio) for the pool members covering this hour."""
+    pairs = []
     for day in pool_days:
         if day[0] is None or day[hour - 1] is None:
             continue
-        ratios.append((math.log(max(day[hour - 1], 1)) - math.log(max(day[0], 1)), 1.0))
-    if not ratios:
+        pairs.append((math.log(max(day[0], 1)),
+                      math.log(max(day[hour - 1], 1)) - math.log(max(day[0], 1))))
+    return pairs
+
+
+def ols_slope(pairs):
+    """Least-squares slope of the log-ratio on log hour-1; 0 if degenerate."""
+    if len(pairs) < 3:
+        return 0.0
+    mean_x = sum(p[0] for p in pairs) / len(pairs)
+    mean_y = sum(p[1] for p in pairs) / len(pairs)
+    sxx = sum((p[0] - mean_x) ** 2 for p in pairs)
+    if sxx <= 1e-12:
+        return 0.0
+    return sum((p[0] - mean_x) * (p[1] - mean_y) for p in pairs) / sxx
+
+
+def pooled_slope(pool_days):
+    """One slope for every hour: the mean of the per-hour OLS slopes."""
+    slopes = []
+    for hour in range(2, 25):
+        pairs = hour_ratio_pairs(pool_days, hour)
+        if len(pairs) >= 3:
+            slopes.append(ols_slope(pairs))
+    return sum(slopes) / len(slopes) if slopes else 0.0
+
+
+# How much wider than the aligned ratios' IQR-based spread the lognormal
+# curve is: conditioning removes systematic variation, so the raw IQR
+# would understate what is left.
+SIGMA_MULT = 1.5
+
+
+def hour_quantiles(pool_days, hour1_print, hour, pooled):
+    """The five quantiles of one hour, as viewer counts.
+
+    Each pool member's log-ratio is first aligned to the target's
+    hour-1 level (see the module docstring); the median, spread and
+    empirical quantiles are then taken over the aligned ratios.
+    """
+    pairs = hour_ratio_pairs(pool_days, hour)
+    if not pairs:
         # No comparable covers this hour: fall back to the house baseline's
         # persistence shape (flat median, spread widening with the hour).
         sigma = 0.15 * math.sqrt(hour - 1)
         return [round2(max(1.0, hour1_print * math.exp(z * sigma))) for z in Z]
+    # The target's log hour-1, kept inside the pool's observed range so a
+    # launch bigger than every pool member does not extrapolate the slope.
+    all_x = [math.log(max(day[0], 1)) for day in pool_days if day[0] is not None]
+    target_x = min(max(math.log(max(hour1_print, 1)), min(all_x)), max(all_x))
+    slope = 0.5 * ols_slope(pairs) + 0.5 * pooled
+    ratios = [(r - slope * (x - target_x), 1.0) for x, r in pairs]
     median = weighted_median(ratios)
-    sigma = max((weighted_quantile(ratios, 0.75) - weighted_quantile(ratios, 0.25)) / 1.349, 0.05)
+    sigma = max((weighted_quantile(ratios, 0.75) - weighted_quantile(ratios, 0.25)) / 1.349, 0.05) * SIGMA_MULT
     lognormal = [median + z * sigma for z in Z]
     empirical = [weighted_quantile(ratios, tau) for tau in LEVELS]
     blended = [(a + b) / 2 for a, b in zip(lognormal, empirical)]
@@ -194,9 +255,10 @@ def forecast_case(case):
         if in_pool(comparable, day):
             pool_days.append(day)
     rows = []
+    pooled = pooled_slope(pool_days)
     for row in case.get("forecast") or []:
         hour = row["hour"]
-        rows.append({"hour": hour, "q": hour_quantiles(pool_days, print1, hour)})
+        rows.append({"hour": hour, "q": hour_quantiles(pool_days, print1, hour, pooled)})
     return {"hours": rows}
 
 
